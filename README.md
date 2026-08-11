@@ -1,5 +1,20 @@
 # wnba-expected-points
 
+## Project Structure
+```
+├── data/                   # Raw and processed data
+├── src/                    # Source code
+│   ├── calibration/        # Model calibration testing
+│   ├── data/               # Data pipeline scripts
+│   ├── model/              # Statistical modeling and analysis
+│   └── visuals/            # Denerated visuals for paper
+└── docs/                   # Documentation
+```
+## Getting Started
+1. Pull data from WeHoop using src/data/pull.R
+2. Run model/xP.R to build expected points model
+3. Refomat data on team, player, shot level using residuals.R
+
 ## Data Sources
 - All data was pulled from WeHoop and saved/used as an .rds and .csv using the script pull.R
 
