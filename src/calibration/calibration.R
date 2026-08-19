@@ -1,157 +1,384 @@
-library(dplyr)
-library(tidyr)
-library(purrr)
+library(tidyverse)
 library(yardstick)
 
+# data prep --------------------------------------------------------------
+xP_2024 <- make_xP_frame(data24)
+xP_2025 <- make_xP_frame(data)
 
-# build frames -----------------------------------------------------------
-# Train on full 2024 data
-xp_frame_2024 <- make_xP_frame(data24)
-xp_frame_2025 <- make_xP_frame(data)
+early_2025 <- xP_2025 |>
+  filter(game_date <= as.Date("2025-07-31"))
+late_2025 <- xP_2025 |>
+  filter(game_date > as.Date("2025-07-31"))
 
-# Build models on 2024
-xp_model <- build_make_model(xp_frame_2024)
-xoreb_model <- build_oreb_model(xp_frame_2024 |> filter(scored == 0))
-xdreb_model <- build_dreb_model(xp_frame_2024 |> filter(scored == 0))
-xfoul_model <- build_foul_model(xp_frame_2024)
+# train models -----------------------------------------------------------
+
+# Main logistic regression models
+make_model <- build_make_model(xP_2024)
+
+oreb_model <- build_oreb_model(
+  xP_2024 |>
+    filter(scored == 0)
+)
+
+foul_model <- build_foul_model(xP_2024)
+
+
+
+# train benchmarks ------------------------------------------------------------------
+
+# The benchmark predicts the historical 2024 event rate.
+
+# Make: all 2024 shots
+# OREB: all missed 2024 shots
+# Foul: all 2024 shots
+
+baseline_make <- glm(
+  scored ~ 1,
+  data = xP_2024,
+  family = binomial()
+)
+
+baseline_oreb <- glm(
+  offensive_rebound ~ 1,
+  data = xP_2024 |> filter(scored == 0),
+  family = binomial()
+)
+
+baseline_foul <- glm(
+  fouled ~ 1,
+  data = xP_2024,
+  family = binomial()
+)
+
 
 
 # generate predictions ---------------------------------------------------
-
-xp_frame_2025 <- xp_frame_2025 |>
-  mutate(
-    p_scored = predict(xp_model, newdata = xp_frame_2025, type = "response"),
-    p_miss = 1 - p_scored,
-    p_oreb = 0,
-    p_dreb = 0,
-    p_foul = predict(xfoul_model, newdata = xp_frame_2025, type = "response")
-  )
-
-# Fill rebound predictions only for missed shots
-missed_idx <- which(xp_frame_2025$scored == 0)
-xp_frame_2025$p_oreb[missed_idx] <- predict(xoreb_model, newdata = xp_frame_2025[missed_idx, ], type = "response")
-xp_frame_2025$p_dreb[missed_idx] <- predict(xdreb_model, newdata = xp_frame_2025[missed_idx, ], type = "response")
-
-# Calculate total xP
-xp_frame_2025 <- xp_frame_2025 |> 
-  mutate(
-    xp = (p_scored * points_attempted) + 
-         (p_miss * ((p_oreb * EOREB) - (p_dreb * EDREB)))
-  )
-
-
-# split data -------------------------------------------------------------
-
-early_2025 <- xp_frame_2025 |> filter(game_date <= "2025-07-31")
-late_2025 <- xp_frame_2025 |> filter(game_date > "2025-07-31")
-
-# plot calibration curves ------------------------------------------------
-plot_calibration <- function(df, pred_col, outcome_col, n_bins = 10, title = "Calibration Plot") {
-  
-  calibration_data <- df |>
+predict_period <- function(data) {
+  data |>
     mutate(
-      bin = ntile({{ pred_col }}, n_bins),
-      outcome = {{ outcome_col }}
-    ) |>
-    group_by(bin) |>
-    summarise(
-      pred_mean = mean({{ pred_col }}, na.rm = TRUE),
-      obs_mean = mean(outcome, na.rm = TRUE),
-      n = n(),
-      se = sqrt(obs_mean * (1 - obs_mean) / n),
-      .groups = "drop"
+      pred_make = predict(
+        make_model,
+        newdata = data,
+        type = "response"
+      ),
+
+      pred_foul = predict(
+        foul_model,
+        newdata = data,
+        type = "response"
+      ),
+
+      pred_make_baseline = predict(
+        baseline_make,
+        newdata = data,
+        type = "response"
+      ),
+
+      pred_foul_baseline = predict(
+        baseline_foul,
+        newdata = data,
+        type = "response"
+      )
     )
-  
-  plot <- ggplot(calibration_data, aes(x = pred_mean, y = obs_mean)) +
-    geom_point(aes(size = n), alpha = 0.6, color = "#1f77b4") +
-    geom_errorbar(
-      aes(ymin = obs_mean - 1.96 * se, ymax = obs_mean + 1.96 * se), 
-      width = 0.02, alpha = 0.5
+}
+
+
+# Make/Foul predictions
+early_pred <- predict_period(early_2025)
+late_pred  <- predict_period(late_2025)
+
+# OREB predictions only on missed shots
+early_pred <- early_pred |>
+  mutate(
+    pred_oreb = NA_real_,
+    pred_oreb_baseline = NA_real_
+  )
+
+early_pred$pred_oreb[early_pred$scored == 0] <-
+  predict(
+    oreb_model,
+    newdata = early_pred |> filter(scored == 0),
+    type = "response"
+  )
+
+early_pred$pred_oreb_baseline[early_pred$scored == 0] <-
+  predict(
+    baseline_oreb,
+    newdata = early_pred |> filter(scored == 0),
+    type = "response"
+  )
+
+
+late_pred <- late_pred |>
+  mutate(
+    pred_oreb = NA_real_,
+    pred_oreb_baseline = NA_real_
+  )
+
+late_pred$pred_oreb[late_pred$scored == 0] <-
+  predict(
+    oreb_model,
+    newdata = late_pred |> filter(scored == 0),
+    type = "response"
+  )
+
+late_pred$pred_oreb_baseline[late_pred$scored == 0] <-
+  predict(
+    baseline_oreb,
+    newdata = late_pred |> filter(scored == 0),
+    type = "response"
+  )
+
+# evaluation -------------------------------------------------------------
+
+evaluate_binary <- function(data, outcome, prediction, benchmark, model_name) {
+  outcome <- rlang::ensym(outcome)
+  prediction <- rlang::ensym(prediction)
+  benchmark <- rlang::ensym(benchmark)
+  truth <- data |>
+    pull(!!outcome)
+  model_pred <- data |>
+    pull(!!prediction)
+  benchmark_pred <- data |>
+    pull(!!benchmark)
+  tibble(
+    # model
+    model = model_name,
+    model_brier = mean(
+      (truth - model_pred)^2,
+      na.rm = TRUE
+    ),
+    model_roc_auc = roc_auc_vec(
+      truth = factor(truth, levels = c(0, 1)),
+      estimate = model_pred,
+      event_level = "second"
+    ),
+
+    # benchmark
+    benchmark_brier = mean(
+      (truth - benchmark_pred)^2,
+      na.rm = TRUE
+    ),
+    benchmark_roc_auc = roc_auc_vec(
+      truth = factor(truth, levels = c(0, 1)),
+      estimate = benchmark_pred,
+      event_level = "second"
+    )
+  ) |>
+    mutate(
+      brier_improvement = benchmark_brier - model_brier,
+      auc_improvement = model_roc_auc - benchmark_roc_auc
+    )
+}
+
+evaluate_period <- function(data, period_name) {
+
+  make_results <- evaluate_binary(
+    data = data,
+    outcome = scored,
+    prediction = pred_make,
+    benchmark = pred_make_baseline,
+    model_name = "Make"
+  )
+
+  oreb_data <- data |>
+    filter(scored == 0)
+
+  oreb_results <- evaluate_binary(
+    data = oreb_data,
+    outcome = offensive_rebound,
+    prediction = pred_oreb,
+    benchmark = pred_oreb_baseline,
+    model_name = "OREB"
+  )
+
+  foul_results <- evaluate_binary(
+    data = data,
+    outcome = fouled,
+    prediction = pred_foul,
+    benchmark = pred_foul_baseline,
+    model_name = "Foul"
+  )
+
+  bind_rows(
+    make_results,
+    oreb_results,
+    foul_results
+  ) |>
+    mutate(period = period_name) |>
+    select(
+      period,
+      model,
+      model_brier,
+      benchmark_brier,
+      brier_improvement,
+      model_roc_auc,
+      benchmark_roc_auc,
+      auc_improvement
+    )
+}
+
+# out of sample evaluation -----------------------------------------------
+
+results <- bind_rows(
+  evaluate_period(early_pred, "Early 2025"),
+  evaluate_period(late_pred, "Late 2025")
+)
+
+results
+
+
+# probability calibration plots ------------------------------------------
+
+library(dplyr)
+library(ggplot2)
+
+calibration_plot <- function(data, truth, prediction,
+                             title = NULL,
+                             bin_width = 0.05) {
+
+  truth <- rlang::ensym(truth)
+  prediction <- rlang::ensym(prediction)
+
+  calibration_data <- data |>
+    transmute(
+      actual = as.numeric(!!truth),
+      predicted = !!prediction
+    ) |>
+    filter(
+      !is.na(actual),
+      !is.na(predicted),
+      is.finite(actual),
+      is.finite(predicted)
+    ) |>
+    mutate(
+      bin_pred_prob = round(predicted / bin_width) * bin_width
+    ) |>
+    group_by(bin_pred_prob) |>
+    summarise(
+      n_shots = n(),
+      bin_actual_prob = mean(actual),
+
+      bin_se = sqrt(
+        bin_actual_prob *
+          (1 - bin_actual_prob) /
+          n_shots
+      ),
+
+      .groups = "drop"
+    ) |>
+    mutate(
+      bin_upper = pmin(
+        bin_actual_prob + 2 * bin_se,
+        1
+      ),
+
+      bin_lower = pmax(
+        bin_actual_prob - 2 * bin_se,
+        0
+      )
+    )
+
+  ggplot(
+    calibration_data,
+    aes(
+      x = bin_pred_prob,
+      y = bin_actual_prob
+    )
+  ) +
+
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      color = "black",
+      linetype = "dashed"
     ) +
-    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", size = 1) +
-    xlim(0, 1) +
-    ylim(0, 1) +
+
+    geom_errorbar(
+      aes(
+        ymin = bin_lower,
+        ymax = bin_upper
+      ),
+      width = 0,
+      linewidth = 0.5
+    ) +
+
+    geom_point(
+      alpha = 0.5
+    ) +
+
+    coord_equal() +
+
+    scale_x_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.2)
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.2)
+    ) +
+
     labs(
       title = title,
-      x = "Predicted Probability",
-      y = "Observed Frequency",
-      size = "Number of Shots"
+      x = "Predicted probability",
+      y = "Observed frequency"
     ) +
-    theme_minimal() +
+
+    theme_bw() +
+
     theme(
-      aspect.ratio = 1,
-      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
-      panel.grid.major = element_line(color = "lightgray", size = 0.3),
-      panel.grid.minor = element_blank()
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold"
+      )
     )
-  
-  return(plot)
 }
 
-prob_metrics <- function(data, truth, estimate, metric_name) {
-  truth_col <- enquo(truth)
-  estimate_col <- enquo(estimate)
-  
-  data %>%
-    mutate(
-      truth = !!truth_col,
-      estimate = !!estimate_col
-    ) %>%
-    filter(is.finite(truth) & is.finite(estimate) & !is.na(truth) & !is.na(estimate)) %>%
-    summarise(
-      brier = mean((truth - estimate)^2, na.rm = TRUE),
-      roc_auc = roc_auc_vec(factor(truth), estimate, event_level = "second"),
-      .groups = "drop"
-    ) %>%
-    pivot_longer(cols = everything(), names_to = "metric", values_to = "value") %>%
-    mutate(metric_type = metric_name)
-}
-
-xP_metrics <- function(data, outcome, prediction, metric_name) {
-  outcome_col <- enquo(outcome)
-  prediction_col <- enquo(prediction)
-  
-  data %>%
-    mutate(
-      outcome = !!outcome_col,
-      prediction = !!prediction_col
-    ) %>%
-    filter(is.finite(outcome) & is.finite(prediction) & !is.na(outcome) & !is.na(prediction)) %>%
-    summarise(
-      rmse = sqrt(mean((outcome - prediction)^2, na.rm = TRUE)),
-      mae = mean(abs(outcome - prediction), na.rm = TRUE),
-      me = mean(outcome - prediction, na.rm = TRUE),
-      median_ae = median(abs(outcome - prediction)),
-      calib_intercept = coef(lm(outcome ~ prediction))[1],
-      calib_slope = coef(lm(outcome ~ prediction))[2],
-      .groups = "drop"
-    ) %>%
-    pivot_longer(cols = everything(), names_to = "metric", values_to = "value") %>%
-    mutate(metric_type = metric_name)
-}
-
-evaluate_split <- function(data) {
-  make_tbl <- prob_metrics(data, scored, pred_make, "make")
-  oreb_tbl <- data %>%
-    filter(scored == 0) %>%
-    prob_metrics(offensive_rebound, pred_oreb, "oreb")
-  foul_tbl <- prob_metrics(data, fouled, pred_foul, "foul")
-  xp_tbl <- xP_metrics(data, score_value, xP, "xp")
-  
-  bind_rows(make_tbl, oreb_tbl, foul_tbl, xp_tbl)
-}
-
-results <- evaluate_split(early_2025_raw)
-results_late <- evaluate_split(late_2025_raw)
-
-cal_xp_early <- plot_calibration(
-  early_2025, pred_col = xp, outcome_col = score_value, 
-  n_bins = 10, title = "Total xP Calibration — Early 2025 (Calibration Set)"
+make_early <- calibration_plot(
+  early_pred,
+  scored,
+  pred_make,
+  "Make — Early 2025"
 )
-print(cal_xp_early)
 
-cal_xp_late <- plot_calibration(
-  late_2025, pred_col = xp, outcome_col = score_value, 
-  n_bins = 10, title = "Total xP Calibration — Late 2025 (Test Set)"
+make_late <- calibration_plot(
+  late_pred,
+  scored,
+  pred_make,
+  "Make — Late 2025"
 )
-print(cal_xp_late)
+
+oreb_early <- calibration_plot(
+  early_pred |> filter(scored == 0),
+  offensive_rebound,
+  pred_oreb,
+  "OREB — Early 2025"
+)
+
+oreb_late <- calibration_plot(
+  late_pred |> filter(scored == 0),
+  offensive_rebound,
+  pred_oreb,
+  "OREB — Late 2025"
+)
+
+foul_early <- calibration_plot(
+  early_pred,
+  fouled,
+  pred_foul,
+  "Foul — Early 2025"
+)
+
+foul_late <- calibration_plot(
+  late_pred,
+  fouled,
+  pred_foul,
+  "Foul — Late 2025"
+)
+
+library(patchwork)
+
+(make_early / make_late) |
+(oreb_early / oreb_late) |
+(foul_early / foul_late) 
